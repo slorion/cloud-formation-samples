@@ -1,0 +1,1767 @@
+# Builds the infrastructure for a fictitious system named Phoenix
+# composed of a server-side front-end app and web services backend running on ECS.
+# ECS deployment is done on spot instances managed by a spot fleet manager.
+# The front-end and backend are backed by a shared PostgreSQL RDS instance composed of three databases:
+# phoenix-core, phoenix-frontend, phoenix-backend (created by an external script not provided in this example).
+#
+# This template assumes an AWS multi-account architecture when naming and tagging resources
+# See https://ruempler.eu/2017/07/09/advantages-aws-multi-account-architecture/
+#
+# Some additional notes:
+#   - IPv4 and IPv6 are both supported
+#   - In addition to a DB and app subnets, both private by default, a DMZ and a public subnets are also created
+#   - The RDS instance is private by default, but can be made publicly accessible via a template parameter ("RDS Public Access IPv4/6 CIDR")
+#   - The RDS instance is encrypted with the provided KMS key (or aws/rds by default)
+#   - AWS Application Load Balancer acts as the TLS traffic endpoint
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Create the full stack required for the Phoenix application.
+  That includes Route53, VPC, subnets, gateways and routing tables, security groups,
+  application load balancer, ECS cluster, RDS instance, SSM parameter store
+  and CloudWatch monitoring.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Network Configuration'
+        Parameters:
+          - HostedZone
+          - RootDomainName
+          - SubDomainName
+          - AvailabilityZones
+          - LoadBalancerSslCertificateArn
+          - VpcCidrBlock
+          - DmzSubnetCidrBlock
+          - Public1SubnetCidrBlock
+          - Public2SubnetCidrBlock
+          - Public3SubnetCidrBlock
+          - Db1SubnetCidrBlock
+          - Db2SubnetCidrBlock
+          - Db3SubnetCidrBlock
+          - App1SubnetCidrBlock
+          - App2SubnetCidrBlock
+          - App3SubnetCidrBlock
+      - Label:
+          default: 'Routing Configuration'
+        Parameters:
+          - AppBackendPathPrefix
+      - Label:
+          default: 'ECS Configuration'
+        Parameters:
+          - KeyName
+          - AppEcsAmi
+          - AppInstanceType
+          - AppMaxSpotInstancePrice
+          - AppSpotFleetTargetCapacity
+          - AppFrontendDesiredCount
+          - AppFrontendContainerCpuLimit
+          - AppFrontendContainerHardMemoryLimit
+          - AppFrontendContainerSoftMemoryLimit
+          - AppBackendDesiredCount
+          - AppBackendContainerCpuLimit
+          - AppBackendContainerHardMemoryLimit
+          - AppBackendContainerSoftMemoryLimit
+      - Label:
+          default: 'Database Configuration'
+        Parameters:
+          - RdsInstanceType
+          - RdsStorageType
+          - RdsStorageIops
+          - RdsAllocatedStorage
+          - RdsSubDomainName
+          - RdsPublicAccessIpv4Cidr
+          - RdsPublicAccessIpv6Cidr
+          - RdsKmsKeyArn
+          - RdsMasterUsername
+          - RdsMasterPassword
+          - RdsMasterPasswordConfirmation
+      - Label:
+          default: 'Application parameters'
+        Parameters:
+          - SsmParamAppDbUsername
+    ParameterLabels:
+      HostedZone:
+        default: 'Hosted Zone'
+      RootDomainName:
+        default: 'Root Domain Name'
+      SubDomainName:
+        default: 'Application Subdomain Name'
+      LoadBalancerSslCertificateArn:
+        default: 'Load Balancer SSL Certificate ARN'
+      AppBackendPathPrefix:
+        default: 'Backend Path Prefix'
+      AvailabilityZones:
+        default: 'Availability Zones'
+      VpcCidrBlock:
+        default: 'VPC CIDR Block'
+      DmzSubnetCidrBlock:
+        default: 'DMZ Subnet CIDR Block'
+      Public1SubnetCidrBlock:
+        default: '1st Public Subnet CIDR Block'
+      Public2SubnetCidrBlock:
+        default: '2nd Public Subnet CIDR Block'
+      Public3SubnetCidrBlock:
+        default: '3rd Public Subnet CIDR Block'
+      Db1SubnetCidrBlock:
+        default: '1st Database Subnet CIDR Block'
+      Db2SubnetCidrBlock:
+        default: '2nd Database Subnet CIDR Block'
+      Db3SubnetCidrBlock:
+        default: '3rd Database Subnet CIDR Block'
+      App1SubnetCidrBlock:
+        default: '1st App Subnet CIDR Block'
+      App2SubnetCidrBlock:
+        default: '2nd App Subnet CIDR Block'
+      App3SubnetCidrBlock:
+        default: '3rd App Subnet CIDR Block'
+      KeyName:
+        default: 'EC2 Key Name for SSH access'
+      AppEcsAmi:
+        default: 'ECS-optimized AMI'
+      AppInstanceType:
+        default: 'App Instance Type'
+      AppMaxSpotInstancePrice:
+        default: 'App Maximum Spot Price'
+      AppSpotFleetTargetCapacity:
+        default: 'Applications Spot Fleet Target Capacity'
+      AppFrontendDesiredCount:
+        default: 'Desired Count for Frontend'
+      AppFrontendContainerCpuLimit:
+        default: 'Container Cpu Limit for Frontend'
+      AppFrontendContainerHardMemoryLimit:
+        default: 'Container Hard Memory Limit for Front-End'
+      AppFrontendContainerSoftMemoryLimit:
+        default: 'Container Soft Memory Limit for Front-End'
+      AppBackendDesiredCount:
+        default: 'Desired Count for Backend'
+      AppBackendContainerCpuLimit:
+        default: 'Container Cpu Limit for Backend'
+      AppBackendContainerHardMemoryLimit:
+        default: 'Container Hard Memory Limit for Backend'
+      AppBackendContainerSoftMemoryLimit:
+        default: 'Container Soft Memory Limit for Backend'
+      RdsInstanceType:
+        default: 'RDS Instance Type'
+      RdsStorageType:
+        default: 'RDS Storage Type'
+      RdsStorageIops:
+        default: 'RDS Storage IOPS'
+      RdsAllocatedStorage:
+        default: 'RDS Allocated Storage'
+      RdsSubDomainName:
+        default: 'RDS Subdomain Name'
+      RdsPublicAccessIpv4Cidr:
+        default: 'RDS Public Access IPv4 CIDR (optional)'
+      RdsPublicAccessIpv6Cidr:
+        default: 'RDS Public Access IPv6 CIDR (optional)'
+      RdsKmsKeyId:
+        default: 'RDS Kms Key ARN (optional)'
+      RdsMasterUsername:
+        default: 'RDS Master Username'
+      RdsMasterPassword:
+        default: 'RDS Master Password'
+      RdsMasterPasswordConfirmation:
+        default: 'RDS Master Password Confirmation'
+      SsmParamAppDbUsername:
+        default: 'DB application account username'
+Parameters:
+  # domain name regex (does not support IDNs): https://stackoverflow.com/a/16491074/852829
+  # IPv4 & IPv6 CIDR regex: http://labs.spritelink.net/regex
+
+  # EC2 instance types: curl https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/index.json | jq -r '.products[].attributes["instanceType"]' | sort -u | grep '\.'
+  # RDS instance types: curl https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonRDS/current/index.json | jq -r '.products[].attributes["instanceType"]' | sort -u | grep '\.'
+  # see also: https://www.ec2instances.info/
+
+  HostedZone:
+    Type: 'AWS::Route53::HostedZone::Id'
+  RootDomainName:
+    Type: 'String'
+    AllowedPattern: '^(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d]\.){1,126}(?!\d+)[a-zA-Z\d]{1,63}$'
+    ConstraintDescription: 'Must be a valid domain name'
+  SubDomainName:
+    Type: 'String'
+    Default: 'phoenix'
+    AllowedPattern: '^(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d]\.){0,125}(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d])$'
+    ConstraintDescription: 'Must be a valid domain name'
+  LoadBalancerSslCertificateArn:
+    Type: 'String'
+  AvailabilityZones:
+    Type: 'List<AWS::EC2::AvailabilityZone::Name>'
+    Description: 'Pick exactly 3 availability zones. They will be used by RDS, ECS and Application Load Balancer.'
+  VpcCidrBlock:
+    Type: 'String'
+    Default: '10.0.0.0/16'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  DmzSubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.0.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Public1SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.1.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Public2SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.2.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Public3SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.3.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Db1SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.10.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Db2SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.11.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  Db3SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.12.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  App1SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.20.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  App2SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.21.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  App3SubnetCidrBlock:
+    Type: 'String'
+    Default: '10.0.22.0/24'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  KeyName:
+    Description: 'Name of an existing EC2 KeyPair to enable SSH access to the ECS instances.'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  AppEcsAmi:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux/recommended/image_id'
+  AppInstanceType:
+    Description: 'The instance type to be used by ECS.'
+    Type: 'String'
+    Default: 't2.micro'
+    AllowedValues: ['c1.medium', 'c1.xlarge', 'c3.2xlarge', 'c3.4xlarge', 'c3.8xlarge', 'c3.large', 'c3.xlarge', 'c4.2xlarge', 'c4.4xlarge', 'c4.8xlarge', 'c4.large', 'c4.xlarge', 'c5.18xlarge', 'c5.2xlarge', 'c5.4xlarge', 'c5.9xlarge', 'c5.large', 'c5.xlarge', 'cc2.8xlarge', 'cg1.4xlarge', 'cr1.8xlarge', 'd2.2xlarge', 'd2.4xlarge', 'd2.8xlarge', 'd2.xlarge', 'f1.16xlarge', 'f1.2xlarge', 'g2.2xlarge', 'g2.8xlarge', 'g3.16xlarge', 'g3.4xlarge', 'g3.8xlarge', 'h1.16xlarge', 'h1.2xlarge', 'h1.4xlarge', 'h1.8xlarge', 'hs1.8xlarge', 'i2.2xlarge', 'i2.4xlarge', 'i2.8xlarge', 'i2.xlarge', 'i3.16xlarge', 'i3.2xlarge', 'i3.4xlarge', 'i3.8xlarge', 'i3.large', 'i3.xlarge', 'm1.large', 'm1.medium', 'm1.small', 'm1.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'm2.xlarge', 'm3.2xlarge', 'm3.large', 'm3.medium', 'm3.xlarge', 'm4.10xlarge', 'm4.16xlarge', 'm4.2xlarge', 'm4.4xlarge', 'm4.large', 'm4.xlarge', 'm5.12xlarge', 'm5.24xlarge', 'm5.2xlarge', 'm5.4xlarge', 'm5.large', 'm5.xlarge', 'p2.16xlarge', 'p2.8xlarge', 'p2.xlarge', 'p3.16xlarge', 'p3.2xlarge', 'p3.8xlarge', 'r3.2xlarge', 'r3.4xlarge', 'r3.8xlarge', 'r3.large', 'r3.xlarge', 'r4.16xlarge', 'r4.2xlarge', 'r4.4xlarge', 'r4.8xlarge', 'r4.large', 'r4.xlarge', 't1.micro', 't2.2xlarge', 't2.large', 't2.medium', 't2.micro', 't2.nano', 't2.small', 't2.xlarge', 'x1.16xlarge', 'x1.32xlarge', 'x1e.16xlarge', 'x1e.2xlarge', 'x1e.32xlarge', 'x1e.4xlarge', 'x1e.8xlarge', x1e.xlarge]
+  AppMaxSpotInstancePrice:
+    Description: 'The maximum spot request price to be used for instances created by ECS. A value of 0 means the maximum price will be set to the on-demand price of the corresponding instance type.'
+    Type: 'Number'
+    Default: '0'
+  AppSpotFleetTargetCapacity:
+    Type: 'Number'
+    Default: '4'
+    MinValue: '0'
+  AppFrontendDesiredCount:
+    Description: 'Should be set to 0 when creating the stack for the first time as no Docker image will be available in ECR and the service creation will hang.'
+    Type: 'Number'
+    Default: '0'
+    MinValue: '0'
+  AppFrontendContainerCpuLimit:
+    Description: 'The minimum number of CPU units to reserve for the container.'
+    Type: 'Number'
+    Default: '512'
+    MinValue: '0'
+  AppFrontendContainerHardMemoryLimit:
+    Description: >
+      The number of MiB of memory to reserve for the container.
+      If your container attempts to exceed the allocated memory, the container is terminated.
+      You must specify one or both of the memory limits.
+      The hard memory limit must be greater than the soft memory limit if both are specified.
+      Enter the value 0 to not specify a limit.
+    Type: 'Number'
+    Default: '0'
+    MinValue: '0'
+  AppFrontendContainerSoftMemoryLimit:
+    Description: >
+      The number of MiB of memory to reserve for the container.
+      When system memory is under contention, Docker attempts to keep the container memory within the limit.
+      If the container requires more memory, it can consume up to the value specified by the Memory property
+      or all of the available memory on the container instance—whichever comes first.
+      You must specify one or both of the memory limits.
+      The hard memory limit must be greater than the soft memory limit if both are specified.
+      Enter the value 0 to not specify a limit.
+    Type: 'Number'
+    Default: '512'
+    MinValue: '0'
+  AppBackendDesiredCount:
+    Description: 'Should be set to 0 when creating the stack for the first time as no Docker image will be available in ECR and the service creation will hang.'
+    Type: 'Number'
+    Default: '0'
+    MinValue: '0'
+  AppBackendContainerCpuLimit:
+    Description: 'The minimum number of CPU units to reserve for the container.'
+    Type: 'Number'
+    Default: '512'
+    MinValue: '0'
+  AppBackendContainerHardMemoryLimit:
+    Description: >
+      The number of MiB of memory to reserve for the container.
+      If your container attempts to exceed the allocated memory, the container is terminated.
+      You must specify one or both of the memory limits.
+      The hard memory limit must be greater than the soft memory limit if both are specified.
+      Enter the value 0 to not specify a limit.
+    Type: 'Number'
+    Default: '0'
+    MinValue: '0'
+  AppBackendContainerSoftMemoryLimit:
+    Description: >
+      The number of MiB of memory to reserve for the container.
+      When system memory is under contention, Docker attempts to keep the container memory within the limit.
+      If the container requires more memory, it can consume up to the value specified by the Memory property
+      or all of the available memory on the container instance—whichever comes first.
+      You must specify one or both of the memory limits.
+      The hard memory limit must be greater than the soft memory limit if both are specified.
+      Enter the value 0 to not specify a limit.
+    Type: 'Number'
+    Default: '512'
+    MinValue: '0'
+  AppBackendPathPrefix:
+    Description: 'The Backend URL path prefix.'
+    Type: 'String'
+    Default: 'api'
+  RdsInstanceType:
+    Description: 'The instance type to be used by RDS.'
+    Type: 'String'
+    Default: 'db.t2.small'
+    AllowedValues: ['db.m1.large', 'db.m1.medium', 'db.m1.small', 'db.m1.xlarge', 'db.m2.2xlarge', 'db.m2.4xlarge', 'db.m2.xlarge', 'db.m3.2xlarge', 'db.m3.large', 'db.m3.medium', 'db.m3.xlarge', 'db.m4.10xlarge', 'db.m4.16xlarge', 'db.m4.2xlarge', 'db.m4.4xlarge', 'db.m4.large', 'db.m4.xlarge', 'db.r3.2xlarge', 'db.r3.4xlarge', 'db.r3.8xlarge', 'db.r3.large', 'db.r3.xlarge', 'db.r4.16xlarge', 'db.r4.2xlarge', 'db.r4.4xlarge', 'db.r4.8xlarge', 'db.r4.large', 'db.r4.xlarge', 'db.t1.micro', 'db.t2.2xlarge', 'db.t2.large', 'db.t2.medium', 'db.t2.micro', 'db.t2.small', 'db.t2.xlarge']
+  RdsStorageType:
+    Description: >
+      gp2 is General Purpose SSD, io1 is Provisioned IOPS and standard is Magnetic Storage.
+      If you specify io1, you must also include a value for the RDS Storage IOPS parameter.
+    Type: 'String'
+    Default: 'standard'
+    AllowedValues: ['standard', 'gp2', 'io1']
+  RdsStorageIops:
+    Description: >
+      The amount of Provisioned IOPS (input/output operations per second) to be initially allocated for the DB instance.
+      For information about valid Iops values, see see Amazon RDS Provisioned IOPS Storage to Improve Performance (https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Storage.html#USER_PIOPS).
+      Constraints: Must be a multiple between 1 and 50 of the storage amount for the DB instance.
+      Must also be an integer multiple of 1000. For example, if the size of your DB instance is 500 GiB, then your Iops value can be 2000, 3000, 4000, or 5000.
+    Type: 'Number'
+    Default: '0'
+    MinValue: '0'
+    MaxValue: '40000'
+  RdsAllocatedStorage:
+    Description: 'The amount of storage (in gibibytes) to allocate for the DB instance.'
+    Type: 'Number'
+    Default: '20'
+    MinValue: '5'
+    MaxValue: '16384'
+  RdsSubDomainName:
+    Description: 'Subdomain name to access the RDS instance'
+    Type: 'String'
+    Default: 'db.phoenix'
+    AllowedPattern: '^(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d]\.){0,125}(?!\-)(?:[a-zA-Z\d\-]{0,62}[a-zA-Z\d])$'
+    ConstraintDescription: 'Must be a valid domain name'
+  RdsPublicAccessIpv4Cidr:
+    Description: 'RDS instance will be publicly accessible to this IPv4 CIDR.'
+    Type: 'String'
+    AllowedPattern: '^(((2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)\.){3}(2(5[0-5]|[0-4][0-9])|[01]?[0-9][0-9]?)(/(3[012]|[12]?[0-9])))?$'
+    ConstraintDescription: 'Must be a valid IPv4 CIDR block'
+  RdsPublicAccessIpv6Cidr:
+    Description: 'RDS instance will be publicly accessible to this IPv6 CIDR.'
+    Type: 'String'
+    AllowedPattern: '^(((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?(\/([0-9]|[1-9][0-9]|1[0-1][0-9]|12[0-8]))?)?$'
+    ConstraintDescription: 'Must be a valid IPv6 CIDR block'
+  RdsKmsKeyArn:
+    Description: 'The KMS encryption key to be used by RDS. Type "aws/rds" to use the default key provided by AWS.'
+    Type: 'String'
+  RdsMasterUsername:
+    Type: 'String'
+    Default: 'phoenix_admin'
+  RdsMasterPassword:
+    Type: 'String'
+    NoEcho: 'true'
+  RdsMasterPasswordConfirmation:
+    Type: 'String'
+    NoEcho: 'true'
+  SsmParamAppDbUsername:
+    Type: 'String'
+    Default: 'phoenix_app'
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,62}$'
+    ConstraintDescription: 'Must begin with a letter. Subsequent characters can be letters, digits or underscores. Maximum length is 63 characters.'
+Rules:
+  # See https://docs.aws.amazon.com/servicecatalog/latest/adminguide/intrinsic-function-reference-rules.html
+  'valid-rds-password':
+    Assertions:
+      - Assert: !Equals [!Ref RdsMasterPassword, !Ref RdsMasterPasswordConfirmation]
+        AssertDescription: "Passwords do not match"
+      - Assert: !Not [!Equals ['RdsMasterPassword', '']]
+        AssertDescription: "Password is required"
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+  HasAppMaxSpotInstancePrice: !Not [!Equals [!Ref AppMaxSpotInstancePrice, '0']]
+  HasAppFrontendContainerHardMemoryLimit: !Not [!Equals [!Ref AppFrontendContainerHardMemoryLimit, '0']]
+  HasAppFrontendContainerSoftMemoryLimit: !Not [!Equals [!Ref AppFrontendContainerSoftMemoryLimit, '0']]
+  HasAppBackendContainerHardMemoryLimit: !Not [!Equals [!Ref AppBackendContainerHardMemoryLimit, '0']]
+  HasAppBackendContainerSoftMemoryLimit: !Not [!Equals [!Ref AppBackendContainerSoftMemoryLimit, '0']]
+  HasRdsStorageIops: !Not [!Equals [!Ref RdsStorageIops, '0']]
+  HasRdsKmsKeyArn: !Not [!Equals [!Ref RdsKmsKeyArn, 'aws/rds']]
+  HasRdsPublicAccessIpv4Cidr: !Not [!Equals [!Ref RdsPublicAccessIpv4Cidr, '']]
+  HasRdsPublicAccessIpv6Cidr: !Not [!Equals [!Ref RdsPublicAccessIpv6Cidr, '']]
+  HasRdsPublicAccess: !Or
+    - Condition: HasRdsPublicAccessIpv4Cidr
+    - Condition: HasRdsPublicAccessIpv6Cidr
+Resources:
+  # --- VPC ---
+  Vpc:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      InstanceTenancy: 'default'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-vpc-${AWS::Region}'
+  VpcIpv6CidrBlock:
+    Type: 'AWS::EC2::VPCCidrBlock'
+    Properties:
+      AmazonProvidedIpv6CidrBlock: 'true'
+      VpcId: !Ref Vpc
+  # --- Subnets ---
+  SubnetDmz:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'true'
+      CidrBlock: !Ref DmzSubnetCidrBlock
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-dmz', !Select [0, !Ref AvailabilityZones]]]
+  SubnetPublic1:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref Public1SubnetCidrBlock
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-public', !Select [0, !Ref AvailabilityZones]]]
+  SubnetPublic2:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref Public2SubnetCidrBlock
+      Ipv6CidrBlock: !Select [2, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-public', !Select [1, !Ref AvailabilityZones]]]
+  SubnetPublic3:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [2, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref Public3SubnetCidrBlock
+      Ipv6CidrBlock: !Select [3, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-public', !Select [2, !Ref AvailabilityZones]]]
+  SubnetDb1:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'true'
+      CidrBlock: !Ref Db1SubnetCidrBlock
+      Ipv6CidrBlock: !Select [4, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-db', !Select [0, !Ref AvailabilityZones]]]
+  SubnetDb2:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref Db2SubnetCidrBlock
+      Ipv6CidrBlock: !Select [5, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-db', !Select [1, !Ref AvailabilityZones]]]
+  SubnetDb3:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [2, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref Db3SubnetCidrBlock
+      Ipv6CidrBlock: !Select [6, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-db', !Select [2, !Ref AvailabilityZones]]]
+  SubnetApp1:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [0, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref App1SubnetCidrBlock
+      Ipv6CidrBlock: !Select [7, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-app', !Select [0, !Ref AvailabilityZones]]]
+  SubnetApp2:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [1, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref App2SubnetCidrBlock
+      Ipv6CidrBlock: !Select [8, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-app', !Select [1, !Ref AvailabilityZones]]]
+  SubnetApp3:
+    Type: 'AWS::EC2::Subnet'
+    DependsOn: VpcIpv6CidrBlock
+    Properties:
+      AvailabilityZone: !Select [2, !Ref AvailabilityZones]
+      # MapPublicIpOnLaunch: 'false' # causes an error when also setting Ipv6CidrBlock
+      AssignIpv6AddressOnCreation: 'false'
+      CidrBlock: !Ref App3SubnetCidrBlock
+      Ipv6CidrBlock: !Select [9, !Cidr [!Select [0, !GetAtt 'Vpc.Ipv6CidrBlocks'], 10, 64]]
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Join ['-', [!Ref 'AWS::StackName', 'subnet-app', !Select [2, !Ref AvailabilityZones]]]
+  # --- NAT & Internet gateways ---
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+          - Key: 'Name'
+            Value: !Sub '${AWS::StackName}-igw-${AWS::Region}'
+  InternetGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+  # for IPv6 private routes
+  EgressOnlyInternetGateway:
+    Type: "AWS::EC2::EgressOnlyInternetGateway"
+    Properties:
+      VpcId: !Ref Vpc
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: 'vpc'
+  NatGateway:
+    Type: 'AWS::EC2::NatGateway'
+    Properties:
+      AllocationId: !Sub '${NatEIP.AllocationId}'
+      SubnetId: !Ref SubnetDmz
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-nat-${SubnetDmz.AvailabilityZone}'
+  # --- Route tables ---
+  RouteTablePublic:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-rtb-public-${AWS::Region}'
+  RoutePublicInternetIpv4:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTablePublic
+  RoutePublicInternetIpv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      DestinationIpv6CidrBlock: '::/0'
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTablePublic
+  RouteTablePrivate:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-rtb-private-${AWS::Region}'
+  RoutePrivateInternetIpv4:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref RouteTablePrivate
+  RoutePrivateInternetIpv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      DestinationIpv6CidrBlock: '::/0'
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyInternetGateway
+      RouteTableId: !Ref RouteTablePrivate
+  # --- Subnet route table associations ---
+  SubnetRouteTableAssociationForDmz:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetDmz
+  SubnetRouteTableAssociationForDb1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !If [HasRdsPublicAccess, !Ref RouteTablePublic, !Ref RouteTablePrivate]
+      SubnetId: !Ref SubnetDb1
+  SubnetRouteTableAssociationForDb2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !If [HasRdsPublicAccess, !Ref RouteTablePublic, !Ref RouteTablePrivate]
+      SubnetId: !Ref SubnetDb2
+  SubnetRouteTableAssociationForDb3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !If [HasRdsPublicAccess, !Ref RouteTablePublic, !Ref RouteTablePrivate]
+      SubnetId: !Ref SubnetDb3
+  SubnetRouteTableAssociationForApp1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      SubnetId: !Ref SubnetApp1
+  SubnetRouteTableAssociationForApp2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      SubnetId: !Ref SubnetApp2
+  SubnetRouteTableAssociationForApp3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      SubnetId: !Ref SubnetApp3
+  SubnetRouteTableAssociationForPublic1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublic1
+  SubnetRouteTableAssociationForPublic2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublic2
+  SubnetRouteTableAssociationForPublic3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublic3
+  # --- Security groups ---
+  SecurityGroupLoadBalancer:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-elb-${AWS::Region}'
+      GroupDescription: 'Application Load Balancer'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIpv6: '::/0'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIpv6: '::/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIpv6: '::/0'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-sg-elb-${AWS::Region}'
+  SecurityGroupLoadBalancerEgressForApp:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '8080'
+      ToPort: '8080'
+      DestinationSecurityGroupId: !Sub '${SecurityGroupApp.GroupId}'
+      GroupId: !Sub '${SecurityGroupLoadBalancer.GroupId}'
+  SecurityGroupDb:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-db-${AWS::Region}'
+      GroupDescription: 'Database'
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIpv6: '::/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIpv6: '::/0'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-sg-db-${AWS::Region}'
+  SecurityGroupDbIngressForApp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '5432'
+      ToPort: '5432'
+      SourceSecurityGroupId: !Sub '${SecurityGroupApp.GroupId}'
+      GroupId: !Sub '${SecurityGroupDb.GroupId}'
+  SecurityGroupDbIngressForPublicAccessIpv4:
+    Condition: HasRdsPublicAccessIpv4Cidr
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '5432'
+      ToPort: '5432'
+      CidrIp: !Ref RdsPublicAccessIpv4Cidr
+      GroupId: !Sub '${SecurityGroupDb.GroupId}'
+  SecurityGroupDbIngressForPublicAccessIpv6:
+    Condition: HasRdsPublicAccessIpv6Cidr
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '5432'
+      ToPort: '5432'
+      CidrIpv6: !Ref RdsPublicAccessIpv6Cidr
+      GroupId: !Sub '${SecurityGroupDb.GroupId}'
+  SecurityGroupApp:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-app-${AWS::Region}'
+      GroupDescription: 'Applications'
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIpv6: '::/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIpv6: '::/0'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-sg-app-${AWS::Region}'
+  SecurityGroupAppIngressForLoadBalancer:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '8080'
+      ToPort: '8080'
+      SourceSecurityGroupId: !Sub '${SecurityGroupLoadBalancer.GroupId}'
+      GroupId: !Sub '${SecurityGroupApp.GroupId}'
+  SecurityGroupAppEgressForDb:
+    Type: 'AWS::EC2::SecurityGroupEgress'
+    Properties:
+      IpProtocol: 'tcp'
+      FromPort: '5432'
+      ToPort: '5432'
+      DestinationSecurityGroupId: !Sub '${SecurityGroupDb.GroupId}'
+      GroupId: !Sub '${SecurityGroupApp.GroupId}'
+  SecurityGroupSshInternal:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-sg-ssh-internal-${AWS::Region}'
+      GroupDescription: 'Internal SSH access'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Sub '${Vpc.CidrBlock}'
+      SecurityGroupEgress:
+        - IpProtocol: 'tcp'
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Sub '${Vpc.CidrBlock}'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-sg-ssh-internal-${AWS::Region}'
+  # --- RDS ---
+  RdsSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupName: !Sub '${AWS::StackName}-rds-subnet-group-${AWS::Region}'
+      DBSubnetGroupDescription: 'Phoenix RDS subnet group'
+      SubnetIds:
+        - !Ref SubnetDb1
+        - !Ref SubnetDb2
+        - !Ref SubnetDb3
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-rds-subnet-group-${AWS::Region}'
+  RdsParameterGroup:
+    Type: 'AWS::RDS::DBParameterGroup'
+    Properties:
+      Description: 'Default Phoenix parameter group'
+      Family: 'postgres10'
+      Parameters:
+        'application_name': 'phoenix'
+        'auto_explain.log_analyze': '1'
+        'auto_explain.log_format': 'json'
+        'datestyle': 'ISO, YMD'
+        'intervalstyle': 'iso_8601'
+        'lc_messages': 'en_US.UTF-8'
+        'lc_monetary': 'en_US.UTF-8'
+        'lc_numeric': 'en_US.UTF-8'
+        'lc_time': 'en_US.UTF-8'
+        'log_checkpoints': '0'
+        'log_min_messages': 'notice'
+        'log_rotation_age': '1440'
+        'log_rotation_size': '0'
+        'max_wal_senders': '15'
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-rds-param-group-${AWS::Region}'
+  RdsInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-rds-instance-${AWS::Region}'
+      # LicenseModel: String
+      MasterUsername: !Ref RdsMasterUsername
+      MasterUserPassword: !Ref RdsMasterPassword
+      DBInstanceClass: !Ref RdsInstanceType
+      Engine: 'postgres'
+      EngineVersion: '10.1'
+      DBParameterGroupName: !Ref RdsParameterGroup
+      Port: '5432'
+      PubliclyAccessible: !If [HasRdsPublicAccess, 'true', 'false']
+      MultiAZ: 'true'
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      StorageType: !Ref RdsStorageType
+      AllocatedStorage: !Ref RdsAllocatedStorage
+      Iops: !If [HasRdsStorageIops, !Ref RdsStorageIops, !Ref 'AWS::NoValue']
+      StorageEncrypted: 'true'
+      KmsKeyId: !If [HasRdsKmsKeyArn, !Ref RdsKmsKeyArn, !Ref 'AWS::NoValue']
+      AllowMajorVersionUpgrade: 'false'
+      AutoMinorVersionUpgrade: 'true'
+      CopyTagsToSnapshot: 'true'
+      BackupRetentionPeriod: '30'
+      PreferredBackupWindow: '00:00-02:00'
+      PreferredMaintenanceWindow: 'sat:03:00-sat:05:00'
+      MonitoringInterval: '60'
+      MonitoringRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/rds-monitoring-role'
+      VPCSecurityGroups:
+        - !Ref SecurityGroupDb
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-rds-instance-${AWS::Region}'
+  # --- EC2 spot fleet manager ---
+  SpotIamInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-spot-instance-${AWS::Region}'
+      Path: !Sub '/${AWS::StackName}/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role'
+  SpotIamInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-spot-iam-profile-${AWS::Region}'
+      Roles:
+        - !Ref SpotIamInstanceRole
+  SpotFleetApp:
+    Type: 'AWS::EC2::SpotFleet'
+    Properties:
+      SpotFleetRequestConfigData:
+        AllocationStrategy: 'lowestPrice'
+        SpotPrice: !If [HasAppMaxSpotInstancePrice, !Ref AppMaxSpotInstancePrice, !Ref 'AWS::NoValue']
+        IamFleetRole: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-ec2-spot-fleet-tagging-role'
+        TargetCapacity: !Ref AppSpotFleetTargetCapacity
+        Type: 'maintain'
+        ExcessCapacityTerminationPolicy: 'default'
+        LaunchSpecifications:
+          - InstanceType: !Ref AppInstanceType
+            ImageId: !Ref AppEcsAmi
+            EbsOptimized: 'false'
+            Monitoring:
+              Enabled: 'true'
+            IamInstanceProfile:
+              Arn: !Sub '${SpotIamInstanceProfile.Arn}'
+            SecurityGroups:
+              - GroupId:
+                  Fn::GetAtt:
+                  - SecurityGroupApp
+                  - GroupId
+            SubnetId: !Sub '${SubnetApp1},${SubnetApp2},${SubnetApp3}'
+            KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+            TagSpecifications:
+              - ResourceType: 'instance'
+                Tags:
+                  - Key: 'Name'
+                    Value: !Sub '${AWS::StackName}-sf-app-${AWS::Region}'
+            UserData:
+              # adapted from the CF template generated by the ECS console when creating a new service
+              Fn::Base64: !Sub |
+                #!/bin/bash
+
+                echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+                export PATH=/usr/local/bin:$PATH
+
+                yum -y install jq
+                easy_install pip
+                pip install awscli
+
+                aws configure set default.region ${AWS::Region}
+                cat <<EOF > /etc/init/spot-instance-termination-notice-handler.conf
+
+                description "Start spot instance termination handler monitoring script"
+                author "Amazon Web Services"
+                start on started ecs
+
+                script
+                  echo \$\$ > /var/run/spot-instance-termination-notice-handler.pid
+                  exec /usr/local/bin/spot-instance-termination-notice-handler.sh
+                end script
+
+                pre-start script
+                  logger "[spot-instance-termination-notice-handler.sh]: spot instance termination notice handler started"
+                end script
+                EOF
+
+                cat <<EOF > /usr/local/bin/spot-instance-termination-notice-handler.sh
+
+                #!/bin/bash
+                while sleep 5; do
+                  if [ -z \$(curl -Isf http://169.254.169.254/latest/meta-data/spot/termination-time)]; then
+                    /bin/false
+                  else
+                    logger "[spot-instance-termination-notice-handler.sh]: spot instance termination notice detected"
+                    STATUS=DRAINING
+                    ECS_CLUSTER=\$(curl -s http://localhost:51678/v1/metadata | jq .Cluster | tr -d \")
+                    CONTAINER_INSTANCE=\$(curl -s http://localhost:51678/v1/metadata | jq .ContainerInstanceArn | tr -d \")
+                    logger "[spot-instance-termination-notice-handler.sh]: putting instance in state \$STATUS"
+
+                    /usr/local/bin/aws ecs update-container-instances-state --cluster \$ECS_CLUSTER --container-instances \$CONTAINER_INSTANCE --status \$STATUS
+
+                    logger "[spot-instance-termination-notice-handler.sh]: putting myself to sleep..."
+                    sleep 120 # exit loop as instance expires in 120 secs after terminating notification
+                  fi
+                done
+                EOF
+
+                chmod +x /usr/local/bin/spot-instance-termination-notice-handler.sh
+  # --- Load balancer ---
+  LoadBalancerApp:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      # Max 32 chars and globally unique, so we let AWS generate it
+      # Name: !Sub '${AWS::StackName}-elb-app-${AWS::Region}'
+      Scheme: 'internet-facing'
+      Type: 'application'
+      IpAddressType: 'dualstack'
+      SecurityGroups:
+        - !Ref SecurityGroupLoadBalancer
+      Subnets:
+        - !Ref SubnetPublic1
+        - !Ref SubnetPublic2
+        - !Ref SubnetPublic3
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-elb-app-${AWS::Region}'
+  LoadBalancerListenerApp:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancerApp
+      Port: '443'
+      Protocol: 'HTTPS'
+      SslPolicy: 'ELBSecurityPolicy-TLS-1-2-2017-01'
+      Certificates:
+        - CertificateArn: !Ref LoadBalancerSslCertificateArn
+      DefaultActions:
+        - Type: 'forward'
+          TargetGroupArn: !Ref TargetGroupAppFrontend
+  LoadBalancerListenerRuleForAppBackend:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      ListenerArn: !Ref LoadBalancerListenerApp
+      Priority: 100
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - !Sub '/${AppBackendPathPrefix}/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupAppBackend
+  TargetGroupAppFrontend:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn: LoadBalancerApp
+    Properties:
+      # Name must be max 32 chars and globally unique, so we let AWS generate it
+      # Name: !Sub '${AWS::StackName}-tg-app-frontend-${AWS::Region}'
+      Protocol: 'HTTP'
+      Port: '8080'
+      TargetType: 'ip'
+      HealthCheckProtocol: 'HTTP'
+      HealthCheckPort: '8080'
+      HealthCheckPath: '/'
+      HealthCheckIntervalSeconds: '300'
+      HealthCheckTimeoutSeconds: '5'
+      HealthyThresholdCount: '5'
+      UnhealthyThresholdCount: '2'
+      Matcher:
+        HttpCode: '200-299,300-399,401,403'
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-tg-app-frontend-${AWS::Region}'
+  TargetGroupAppBackend:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    DependsOn: LoadBalancerApp
+    Properties:
+      # Name must be max 32 chars and globally unique, so we let AWS generate it
+      # Name: !Sub '${AWS::StackName}-tg-app-backend-${AWS::Region}'
+      Protocol: 'HTTP'
+      Port: '8080'
+      TargetType: 'ip'
+      HealthCheckProtocol: 'HTTP'
+      HealthCheckPort: '8080'
+      HealthCheckPath: !Sub '/${AppBackendPathPrefix}/'
+      HealthCheckIntervalSeconds: '300'
+      HealthCheckTimeoutSeconds: '5'
+      HealthyThresholdCount: '5'
+      UnhealthyThresholdCount: '2'
+      Matcher:
+        HttpCode: '200-299,300-399,401,403'
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-tg-app-backend-${AWS::Region}'
+  # --- ECR ---
+  EcrAppFrontend:
+    Type: 'AWS::ECR::Repository'
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-ecr-app-frontend-${AWS::Region}'
+  EcrAppBackend:
+    Type: 'AWS::ECR::Repository'
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-ecr-app-backend-${AWS::Region}'
+  # --- ECS ---
+
+  # For considerations about creating IAM roles for ECS tasks,
+  # see https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-iam-roles.html
+
+  # NOTE:
+  #   CF does not handle well dependency between ECS service and the load balancer:
+  #   it waits for the associated target group to be created, but not on the load balancer/listener/rules.
+  #   To compensate, explicit dependencies on listener rules are declared:
+  #     - LoadBalancerListenerApp for EcsServiceAppFrontend (service uses the default rule of the listener)
+  #     - LoadBalancerListenerRuleForAppBackend for EcsServiceAppBackend
+  #   See related Terraform issue: https://github.com/hashicorp/terraform/issues/12634
+
+  EcsCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-ecs-cluster-${AWS::Region}'
+  EcsTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-execution-${AWS::Region}'
+      Path: !Sub '/${AWS::StackName}/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ecs-tasks.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  EcsTaskRoleFrontend:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-app-frontend-${AWS::Region}'
+      Path: !Sub '/${AWS::StackName}/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ecs-tasks.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-param-store-app-frontend-${AWS::Region}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'ssm:GetParametersByPath'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/phoenix/app-shared'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/phoenix/app-frontend'
+  EcsTaskRoleBackend:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecs-task-app-backend-${AWS::Region}'
+      Path: !Sub '/${AWS::StackName}/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ecs-tasks.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-param-store-app-backend-${AWS::Region}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'ssm:GetParametersByPath'
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/phoenix/app-shared'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/phoenix/app-backend'
+  EcsTaskDefinitionAppFrontend:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Sub '${AWS::StackName}-ecs-task-app-frontend'
+      NetworkMode: 'awsvpc'
+      ExecutionRoleArn: !Sub '${EcsTaskExecutionRole.Arn}'
+      TaskRoleArn: !Sub '${EcsTaskRoleFrontend.Arn}'
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-ecs-container-app-frontend'
+          Essential: 'true'
+          Privileged: 'false'
+          Cpu: !Ref AppFrontendContainerCpuLimit
+          Memory: !If [HasAppFrontendContainerHardMemoryLimit, !Ref AppFrontendContainerHardMemoryLimit, !Ref 'AWS::NoValue']
+          MemoryReservation: !If [HasAppFrontendContainerSoftMemoryLimit, !Ref AppFrontendContainerSoftMemoryLimit, !Ref 'AWS::NoValue']
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrAppFrontend}:latest'
+          PortMappings:
+            - Protocol: 'tcp'
+              ContainerPort: '8080'
+              HostPort: '8080'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              'awslogs-group': !Sub '${AWS::StackName}-app-frontend'
+              'awslogs-region': !Ref AWS::Region
+              'awslogs-stream-prefix': !Sub '${AWS::StackName}-app-frontend'
+          Environment:
+            - Name: 'PHOENIX_REGION_NAME'
+              Value: !Ref 'AWS::Region'
+            - Name: 'PHOENIX_STACK_NAME'
+              Value: !Ref 'AWS::StackName'
+  EcsTaskDefinitionAppBackend:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: !Sub '${AWS::StackName}-ecs-task-app-backend'
+      NetworkMode: 'awsvpc'
+      ExecutionRoleArn: !Sub '${EcsTaskExecutionRole.Arn}'
+      TaskRoleArn: !Sub '${EcsTaskRoleBackend.Arn}'
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}-ecs-container-app-backend'
+          Essential: 'true'
+          Privileged: 'false'
+          Cpu: !Ref AppBackendContainerCpuLimit
+          Memory: !If [HasAppBackendContainerHardMemoryLimit, !Ref AppBackendContainerHardMemoryLimit, !Ref 'AWS::NoValue']
+          MemoryReservation: !If [HasAppBackendContainerSoftMemoryLimit, !Ref AppBackendContainerSoftMemoryLimit, !Ref 'AWS::NoValue']
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrAppBackend}:latest'
+          PortMappings:
+            - Protocol: 'tcp'
+              ContainerPort: '8080'
+              HostPort: '8080'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              'awslogs-group': !Sub '${AWS::StackName}-app-backend'
+              'awslogs-region': !Ref AWS::Region
+              'awslogs-stream-prefix': !Sub '${AWS::StackName}-app-backend'
+          Environment:
+            - Name: 'PHOENIX_REGION_NAME'
+              Value: !Ref 'AWS::Region'
+            - Name: 'PHOENIX_STACK_NAME'
+              Value: !Ref 'AWS::StackName'
+  EcsServiceAppFrontend:
+    Type: 'AWS::ECS::Service'
+    DependsOn: LoadBalancerListenerApp
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-ecs-service-app-frontend-${AWS::Region}'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref EcsTaskDefinitionAppFrontend
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: !Ref AppFrontendDesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: 'EC2'
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-ecs-container-app-frontend'
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroupAppFrontend
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: 'DISABLED'
+          SecurityGroups:
+            - !Ref SecurityGroupApp
+          Subnets:
+            - !Ref SubnetApp1
+            - !Ref SubnetApp2
+            - !Ref SubnetApp3
+      PlacementStrategies:
+        - Type: 'spread'
+          Field: 'attribute:ecs.availability-zone'
+        - Type: 'spread'
+          Field: 'instanceId'
+  EcsServiceAppBackend:
+    Type: 'AWS::ECS::Service'
+    DependsOn: LoadBalancerListenerRuleForAppBackend
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-ecs-service-app-backend-${AWS::Region}'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref EcsTaskDefinitionAppBackend
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: !Ref AppBackendDesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: 'EC2'
+      LoadBalancers:
+        - ContainerName: !Sub '${AWS::StackName}-ecs-container-app-backend'
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroupAppBackend
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: 'DISABLED'
+          SecurityGroups:
+            - !Ref SecurityGroupApp
+          Subnets:
+            - !Ref SubnetApp1
+            - !Ref SubnetApp2
+            - !Ref SubnetApp3
+      PlacementStrategies:
+        - Type: 'spread'
+          Field: 'attribute:ecs.availability-zone'
+        - Type: 'spread'
+          Field: 'instanceId'
+  # --- Auto-scaling ---
+  ScalableTargetAppFrontend:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Properties:
+      ServiceNamespace: 'ecs'
+      ScalableDimension: 'ecs:service:DesiredCount'
+      MinCapacity: '1'
+      MaxCapacity: '5'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ResourceId: !Sub 'service/${EcsCluster}/${EcsServiceAppFrontend.Name}'
+  ScalableTargetAppBackend:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Properties:
+      ServiceNamespace: 'ecs'
+      ScalableDimension: 'ecs:service:DesiredCount'
+      MinCapacity: '1'
+      MaxCapacity: '5'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ResourceId: !Sub 'service/${EcsCluster}/${EcsServiceAppBackend.Name}'
+  ScalingPolicyAppFrontendScaleOut:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-out-app-frontend-${AWS::Region}'
+      PolicyType: 'StepScaling'
+      ScalingTargetId: !Ref ScalableTargetAppFrontend
+      StepScalingPolicyConfiguration:
+        AdjustmentType: 'ChangeInCapacity'
+        Cooldown: '300'
+        MetricAggregationType: 'Average'
+        StepAdjustments:
+          - MetricIntervalLowerBound: '0'
+            ScalingAdjustment: '1'
+  ScalingPolicyAppFrontendScaleIn:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-in-app-frontend-${AWS::Region}'
+      PolicyType: 'StepScaling'
+      ScalingTargetId: !Ref ScalableTargetAppFrontend
+      StepScalingPolicyConfiguration:
+        AdjustmentType: 'ChangeInCapacity'
+        Cooldown: '300'
+        MetricAggregationType: 'Average'
+        StepAdjustments:
+          - MetricIntervalLowerBound: '0'
+            ScalingAdjustment: '-1'
+  AlarmAppFrontendCpuHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-app-frontend-cpu-utilization-high-${AWS::Region}'
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref ScalingPolicyAppFrontendScaleOut
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: 'ClusterName'
+          Value: !Ref EcsCluster
+        - Name: 'ServiceName'
+          Value: !Sub '${EcsServiceAppFrontend.Name}'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Statistic: 'Average'
+      Threshold: '70'
+      Unit: 'Percent'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'breaching'
+  AlarmAppFrontendCpuLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-app-frontend-cpu-utilization-low-${AWS::Region}'
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref ScalingPolicyAppFrontendScaleIn
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: 'ClusterName'
+          Value: !Ref EcsCluster
+        - Name: 'ServiceName'
+          Value: !Sub '${EcsServiceAppFrontend.Name}'
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Statistic: 'Average'
+      Threshold: '30'
+      Unit: 'Percent'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'missing'
+  ScalingPolicyAppBackendScaleOut:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-out-app-backend-${AWS::Region}'
+      PolicyType: 'StepScaling'
+      ScalingTargetId: !Ref ScalableTargetAppBackend
+      StepScalingPolicyConfiguration:
+        AdjustmentType: 'ChangeInCapacity'
+        Cooldown: '300'
+        MetricAggregationType: 'Average'
+        StepAdjustments:
+          - MetricIntervalLowerBound: '0'
+            ScalingAdjustment: '1'
+  ScalingPolicyAppBackendScaleIn:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-in-app-backend-${AWS::Region}'
+      PolicyType: 'StepScaling'
+      ScalingTargetId: !Ref ScalableTargetAppBackend
+      StepScalingPolicyConfiguration:
+        AdjustmentType: 'ChangeInCapacity'
+        Cooldown: '300'
+        MetricAggregationType: 'Average'
+        StepAdjustments:
+          - MetricIntervalLowerBound: '0'
+            ScalingAdjustment: '-1'
+  AlarmAppBackendCpuHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-app-backend-cpu-utilization-high-${AWS::Region}'
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref ScalingPolicyAppBackendScaleOut
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: 'ClusterName'
+          Value: !Ref EcsCluster
+        - Name: 'ServiceName'
+          Value: !Sub '${EcsServiceAppBackend.Name}'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Statistic: 'Average'
+      Threshold: '70'
+      Unit: 'Percent'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'breaching'
+  AlarmAppBackendCpuLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-app-backend-cpu-utilization-low-${AWS::Region}'
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref ScalingPolicyAppBackendScaleIn
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: 'ClusterName'
+          Value: !Ref EcsCluster
+        - Name: 'ServiceName'
+          Value: !Sub '${EcsServiceAppBackend.Name}'
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Statistic: 'Average'
+      Threshold: '30'
+      Unit: 'Percent'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'missing'
+  # --- SNS ---
+  SnsCloudWatchAlerts:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: !Sub '${AWS::StackName}-cloudwatch-alerts-${AWS::Region}'
+  # --- CloudWatch logs ---
+  LogGroupAppFrontend:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub '${AWS::StackName}-app-frontend'
+      RetentionInDays: '30'
+  LogGroupAppBackend:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub '${AWS::StackName}-app-backend'
+      RetentionInDays: '30'
+  # --- Database CloudWatch alarms ---
+  AlarmDbCpuHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-db-cpu-utilization-high-${AWS::Region}'
+      Dimensions:
+        - Name: 'DBInstanceIdentifier'
+          Value: !Ref RdsInstance
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/RDS'
+      MetricName: 'CPUUtilization'
+      Statistic: 'Average'
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Threshold: '70'
+      Unit: 'Percent'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'breaching'
+  AlarmDbFreeableMemoryLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-db-freeable-memory-low-${AWS::Region}'
+      Dimensions:
+        - Name: 'DBInstanceIdentifier'
+          Value: !Ref RdsInstance
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/RDS'
+      MetricName: 'FreeableMemory'
+      Statistic: 'Average'
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Threshold: '50000000'
+      Unit: 'Bytes'
+      Period: '60'
+      EvaluationPeriods: '5'
+      TreatMissingData: 'breaching'
+  AlarmDbFreeStorageSpaceLow:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-db-free-storage-space-low-${AWS::Region}'
+      Dimensions:
+        - Name: 'DBInstanceIdentifier'
+          Value: !Ref RdsInstance
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/RDS'
+      MetricName: 'FreeStorageSpace'
+      Statistic: 'Average'
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Threshold: '5000000000'
+      Unit: 'Bytes'
+      Period: '60'
+      EvaluationPeriods: '1'
+      TreatMissingData: 'breaching'
+  # --- Applications CloudWatch alarms ---
+  AlarmHttpCodeElb5XXTooHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-http-code-elb-5xx-count-too-high-${AWS::Region}'
+      AlarmDescription: 'Application load balancer returns 5XX HTTP status codes'
+      Dimensions:
+        - Name: 'LoadBalancer'
+          Value: !Sub '${LoadBalancerApp.LoadBalancerFullName}'
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/ApplicationELB'
+      MetricName: HTTPCode_ELB_5XX_Count
+      Statistic: Sum
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      Period: '60'
+      EvaluationPeriods: '1'
+  AlarmHttpCodeTarget5XXTooHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-http-code-target-5xx-count-too-high-${AWS::Region}'
+      AlarmDescription: 'Application load balancer receives 5XX HTTP status codes from targets'
+      Dimensions:
+        - Name: 'LoadBalancer'
+          Value: !Sub '${LoadBalancerApp.LoadBalancerFullName}'
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/ApplicationELB'
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      Period: '60'
+      EvaluationPeriods: '1'
+  AlarmRejectedConnectionCountTooHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-rejected-connection-count-too-high-${AWS::Region}'
+      AlarmDescription: 'Application load balancer rejected connections because the load balancer had reached its maximum number of connections'
+      Dimensions:
+        - Name: 'LoadBalancer'
+          Value: !Sub '${LoadBalancerApp.LoadBalancerFullName}'
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/ApplicationELB'
+      MetricName: RejectedConnectionCount
+      Statistic: Sum
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      Period: '60'
+      EvaluationPeriods: '1'
+  AlarmTargetConnectionErrorCountTooHigh:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-alarm-target-connection-error-count-too-high-${AWS::Region}'
+      AlarmDescription: 'Application load balancer could not connect to targets'
+      Dimensions:
+        - Name: 'LoadBalancer'
+          Value: !Sub '${LoadBalancerApp.LoadBalancerFullName}'
+      AlarmActions:
+        - !Ref SnsCloudWatchAlerts
+      Namespace: 'AWS/ApplicationELB'
+      MetricName: TargetConnectionErrorCount
+      Statistic: Sum
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      Period: '60'
+      EvaluationPeriods: '1'
+  # --- Route 53 ---
+  Route53RecordSetDb:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${RdsSubDomainName}.${RootDomainName}'
+      ResourceRecords:
+        - !Sub '${RdsInstance.Endpoint.Address}'
+      TTL: '300'
+      Type: 'CNAME'
+  Route53RecordSetApp:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${SubDomainName}.${RootDomainName}'
+      ResourceRecords:
+        - !Sub '${LoadBalancerApp.DNSName}'
+      TTL: '300'
+      Type: 'CNAME'
+  # --- Parameter Store - Shared configuration ---
+  # The following parameters need to be created manually:
+  #   - /${AWS::StackName}/phoenix/app-shared/phoenix.data.core.db.jdbc.password (SecureString)
+  #   - /${AWS::StackName}/phoenix/app-frontend/phoenix.data.frontend.db.jdbc.password (SecureString)
+  #   - /${AWS::StackName}/phoenix/app-backend/phoenix.data.backend.db.jdbc.password (SecureString)
+  ParameterSharedCoreJdbcUrl:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-shared/phoenix.data.core.db.jdbc.url'
+      Description: 'Core database URL'
+      Type: String
+      Value: !Sub 'jdbc:postgresql://${RdsInstance.Endpoint.Address}:${RdsInstance.Endpoint.Port}/phoenix_core'
+  ParameterSharedCoreJdbcUsername:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-shared/phoenix.data.core.db.jdbc.username'
+      Description: 'Core database username'
+      Type: String
+      Value: !Ref SsmParamAppDbUsername
+  # --- Parameter Store - Frontend configuration ---
+  ParameterAppFrontendJdbcUrl:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-frontend/phoenix.data.frontend.db.jdbc.url'
+      Description: 'Frontend database URL'
+      Type: String
+      Value: !Sub 'jdbc:postgresql://${RdsInstance.Endpoint.Address}:${RdsInstance.Endpoint.Port}/phoenix_frontend'
+  ParameterAppFrontendJdbcUsername:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-frontend/phoenix.data.frontend.db.jdbc.username'
+      Description: 'Frontend database username'
+      Type: String
+      Value: !Ref SsmParamAppDbUsername
+  ParameterAppFrontendHttpPort:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-frontend/phoenix.web.http-port'
+      Description: 'Frontend HTTP port'
+      Type: String
+      Value: '8080'
+  ParameterAppFrontendUrlPathPrefix:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-frontend/phoenix.web.url-path-prefix'
+      Description: 'Frontend URL path prefix'
+      Type: String
+      Value: '/'
+  # --- Parameter Store - Backend configuration ---
+  ParameterAppBackendJdbcUrl:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-backend/phoenix.data.backend.db.jdbc.url'
+      Description: >
+        Backend database URL.
+        ${account-id} will be substituted with the backend client account ID at runtime.
+      Type: String
+      Value: !Sub 'jdbc:postgresql://${RdsInstance.Endpoint.Address}:${RdsInstance.Endpoint.Port}/phoenix_backend_${!account-id}'
+  ParameterAppBackendJdbcUsername:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-backend/phoenix.data.backend.db.jdbc.username'
+      Description: 'Backend database username'
+      Type: String
+      Value: !Ref SsmParamAppDbUsername
+  ParameterAppBackendHttpPort:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-backend/phoenix.web.http-port'
+      Description: 'Backend HTTP port'
+      Type: String
+      Value: '8080'
+  ParameterAppBackendUrlPathPrefix:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Sub '/${AWS::StackName}/phoenix/app-backend/phoenix.web.url-path-prefix'
+      Description: 'Backend URL path prefix'
+      Type: String
+      Value: !Sub '/${AppBackendPathPrefix}'
+Outputs:
+  StackName:
+    Value: !Ref 'AWS::StackName'
+  AppDomainName:
+    Description: The Phoenix application domain name
+    Value: !Ref Route53RecordSetApp
+  VpcId:
+    Value: !Ref Vpc
+  DmzSubnetId:
+    Value: !Ref SubnetDmz
+  Public1SubnetId:
+    Value: !Ref SubnetPublic1
+  Public2SubnetId:
+    Value: !Ref SubnetPublic2
+  Public3SubnetId:
+    Value: !Ref SubnetPublic3
+  Db1SubnetId:
+    Value: !Ref SubnetDb1
+  Db2SubnetId:
+    Value: !Ref SubnetDb2
+  Db3SubnetId:
+    Value: !Ref SubnetDb3
+  App1SubnetId:
+    Value: !Ref SubnetApp1
+  App2SubnetId:
+    Value: !Ref SubnetApp2
+  App3SubnetId:
+    Value: !Ref SubnetApp3
+  RdsInstanceIdentifier:
+    Value: !Ref RdsInstance
+  RdsInstanceEndpointAddress:
+    Value: !Sub '${RdsInstance.Endpoint.Address}'
+  RdsInstanceEndpointPort:
+    Value: !Sub '${RdsInstance.Endpoint.Port}'
+  AppSpotFleetName:
+    Value: !Ref SpotFleetApp
+  AppLoadBalancerArn:
+    Value: !Ref LoadBalancerApp
+  AppLoadBalancerDnsName:
+    Value: !Sub '${LoadBalancerApp.DNSName}'
+  AppFrontendTargetGroupArn:
+    Value: !Ref TargetGroupAppFrontend
+  AppBackendTargetGroupArn:
+    Value: !Ref TargetGroupAppBackend
+  AppFrontendEcrName:
+    Value: !Ref EcrAppFrontend
+  AppBackendEcrName:
+    Value: !Ref EcrAppBackend
+  AppEcsClusterName:
+    Value: !Ref EcsCluster
+  EcsClusterArn:
+    Value: !Sub '${EcsCluster.Arn}'
+  AppFrontendEcsServiceArn:
+    Value: !Ref EcsServiceAppFrontend
+  AppBackendEcsServiceArn:
+    Value: !Ref EcsServiceAppBackend
+  AppFrontendEcsTaskDefinitionArn:
+    Value: !Ref EcsTaskDefinitionAppFrontend
+  AppBackendEcsTaskDefinitionArn:
+    Value: !Ref EcsTaskDefinitionAppBackend
